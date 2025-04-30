@@ -1,6 +1,7 @@
 import os
 import openai
 import pickle
+import json
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -8,6 +9,13 @@ from google.auth.transport.requests import Request
 from collections import defaultdict
 from email.mime.text import MIMEText
 import base64
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=".env")
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# print("Key Loaded:", openai.api_key is not None)
 
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly','https://www.googleapis.com/auth/gmail.send']
@@ -30,7 +38,7 @@ def authenticate_email():
 
 def get_emails(service):
     print("Fetching emails...")
-    results = service.users().messages().list(userId='me', maxResults=10, q="category:primary").execute()
+    results = service.users().messages().list(userId='me', maxResults=20,q="category:primary").execute()
     messages = results.get('messages', [])
     
     categorized_emails = categorize_emails(service, messages)
@@ -44,16 +52,28 @@ def get_emails(service):
     
     return summary_text
 
-openai.api_key = openai.api_key = os.getenv("OPENAI_API_KEY")
 def summarize_content(content):
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": f"Summarize the following email content:\n\n{content}"}],
-            max_tokens=50
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes emails into concise 2–3 sentence summaries for Aishwarya Janardhana Rajur. Dont mention Aishwarya Janardhana in every email as you are doing this summary for me. Also, make sure if there are next steps titled email with a link, categorise them under Online assesments. If the subject has ask for scheduling a call with them or it is sent from an actual person, categorize it to Recruiter reachout"},
+                {"role": "user", "content": f"""
+Summarize this email in 2–3 sentences and categorize it into one of the following and also make sure to categorise applied application email to job applications and not recruiter reachout. Also recruiter reachout is one where recruiter is scheduling for a call or some real human messaging:
+Recruiter reachout, Online Assesments, Job Applications, Rejections, Shopping, Tech Newsletters, or Other.
+
+Respond ONLY in this JSON format:
+{{"summary": "...", "category": "..."}}.
+
+Email content:
+{content}
+                """}
+            ],
+            max_tokens=100,
+            temperature=0.3
             
         )
-        return response.choices[0].message['content'].strip()
+        return json.loads(response.choices[0].message["content"].strip())
     except Exception as e:
         print(f"An error occurred with OpenAI API: {e}")
         return content[:100]  # Fallback to the first 100 chars if API fails
@@ -62,31 +82,25 @@ def categorize_emails(service, messages):
     categorized_emails = defaultdict(list)
 
     for message in messages:
-        # Retrieve full email message
         msg = service.users().messages().get(userId='me', id=message['id']).execute()
         headers = msg['payload']['headers']
-        
-        # Extract subject and snippet
-        subject = next((header['value'] for header in headers if header['name'] == 'Subject'), 'No Subject')
         snippet = msg.get('snippet', 'No Snippet')
-        
-        # Fetch and summarize the full email text
-        full_content = msg.get('snippet', 'No Content Available')
-        summary = summarize_content(full_content)
-        
-        # Categorize based on keywords
-        if any(keyword in subject.lower() for keyword in ['thanks for applying', 'application received']):
-            categorized_emails['Job Applications'].append({'subject': subject, 'summary': summary})
-        elif any(keyword in subject.lower() for keyword in ['rejected', 'sorry', 'regret']):
-            categorized_emails['Rejections'].append({'subject': subject, 'summary': summary})
-        elif any(keyword in subject.lower() for keyword in ['reward', 'coupon', 'sale', 'discount']):
-            categorized_emails['Shopping Codes'].append({'subject': subject, 'summary': summary})
-        elif any(keyword in subject.lower() for keyword in ['newsletter', 'tech', 'update']):
-            categorized_emails['Tech Newsletters'].append({'subject': subject, 'summary': summary})
-        else:
-            categorized_emails['Other'].append({'subject': subject, 'summary': summary})
 
+        # Get subject or use fallback
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '').strip()
+        if not subject or subject.lower() == "no subject":
+            subject = snippet[:30] + "..."
+
+        # Summarize and categorize using GPT
+        full_content = snippet
+        result = summarize_content(full_content)
+        summary = result.get("summary", snippet[:100])
+        category = result.get("category", "Other")
+
+        categorized_emails[category].append({'subject': subject, 'summary': summary})
     return categorized_emails
+
+
 
 def create_message(to, subject, body):
     message = MIMEText(body)
@@ -114,7 +128,7 @@ def main():
     # Fetch and categorize emails with AI-generated summaries
     summary_text = get_emails(service)
 
-    recipient_email = "aishwaryajanardhana@gmail.com"
+    recipient_email = "aishwarya.j.rajur@gmail.com"
     
     # Send the summary email to yourself
     send_summary_email(service, summary_text, recipient_email)
